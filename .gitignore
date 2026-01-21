@@ -1,0 +1,61 @@
+# Build outputs
+core/build/
+cli/target/
+*.dylib
+*.so
+*.a
+*.o
+*.obj
+
+# Python
+venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*.sublime-*
+.vs/
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Test files (remove after testing)
+test_*
+*_test
+benchmark_*
+test_report.md
+
+# Temporary
+*.tmp
+*.log
+*.bak
+*~
+
+# Model files (too large for git)
+*.omni
+*.gguf
+*.safetensors
+
+# CMake
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+Makefile
+*.cmake
+!CMakeLists.txt
+
+# Rust
+Cargo.lock
+# Keep Cargo.lock for binary projects, but it's already in cli/

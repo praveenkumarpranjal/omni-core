@@ -1,0 +1,18 @@
+[package]
+name = "omni"
+version = "0.1.0"
+edition = "2021"
+authors = ["Omni Team"]
+description = "Fastest CPU inference engine for LLMs on Apple Silicon"
+
+[dependencies]
+clap = { version = "4.5", features = ["derive"] }
+libc = "0.2"
+
+[build-dependencies]
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true
