@@ -1,0 +1,11 @@
+#!/bin/bash
+# Omni CLI wrapper script
+
+# Get the directory where this script is located
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# Set library path
+export DYLD_LIBRARY_PATH="$SCRIPT_DIR/core/build:$DYLD_LIBRARY_PATH"
+
+# Run the Rust CLI
+exec "$SCRIPT_DIR/cli/target/release/omni" "$@"

@@ -194,6 +194,95 @@ y = self.out_proj(y)
 
 ---
 
+## From justine.lol (llamafile) - CRITICAL OPTIMIZATION TECHNIQUE
+
+### Outer Loop Unrolling for Matrix Multiplication
+
+**Key Insight**: Unroll BOTH outer loops (not inner loop) to share register loads across multiple FMAs.
+
+**Why This Works**:
+- Modern CPUs can speculatively execute inner loops on their own
+- Unrolling outer loops enables sharing register loads across multiple operations
+- Example: Load `a0` once, use it for 4 different FMAs with `k0, k1, k2, k3`
+- Reduces memory references while exploiting instruction-level parallelism
+
+**Performance Gains**:
+- 2x faster than Intel MKL for matrices that fit in L2 cache (512-1024 size)
+- 30-500% faster prompt processing for llama.cpp
+- 810 GFLOPS on Alderlake i9-14900K (vs 295 GFLOPS for MKL at same size)
+
+**Technique - 3x4 Tile Example**:
+```cpp
+// Unroll both outer loops: process 3 rows x 4 cols at once
+for (int i = 0; i < m; i += 3)
+    for (int j = 0; j < n; j += 4) {
+        // 12 accumulators (3x4 tile)
+        __m256 c00, c01, c02, c03;
+        __m256 c10, c11, c12, c13;
+        __m256 c20, c21, c22, c23;
+        
+        for (int l = 0; l < k; l += 8) {
+            // Load B columns once
+            __m256 k0 = load(B + j*ldb + l);
+            __m256 k1 = load(B + (j+1)*ldb + l);
+            __m256 k2 = load(B + (j+2)*ldb + l);
+            __m256 k3 = load(B + (j+3)*ldb + l);
+            
+            // Load A row 0, use for 4 FMAs
+            __m256 a0 = load(A + i*lda + l);
+            c00 = fma(a0, k0, c00);
+            c01 = fma(a0, k1, c01);
+            c02 = fma(a0, k2, c02);
+            c03 = fma(a0, k3, c03);
+            
+            // Load A row 1, use for 4 FMAs
+            __m256 a1 = load(A + (i+1)*lda + l);
+            c10 = fma(a1, k0, c10);
+            c11 = fma(a1, k1, c11);
+            c12 = fma(a1, k2, c12);
+            c13 = fma(a1, k3, c13);
+            
+            // Load A row 2, use for 4 FMAs
+            __m256 a2 = load(A + (i+2)*lda + l);
+            c20 = fma(a2, k0, c20);
+            c21 = fma(a2, k1, c21);
+            c22 = fma(a2, k2, c22);
+            c23 = fma(a2, k3, c23);
+        }
+        // Store 12 results
+    }
+```
+
+**Key Points**:
+- Each `k` vector is loaded once and used for 3 FMAs (shared across rows)
+- Each `a` vector is loaded once and used for 4 FMAs (shared across columns)
+- Total: 7 loads (4 k + 3 a) for 12 FMAs = 1.7x better than naive
+- Works best for matrices that fit in L2 cache (512-1024 elements)
+
+**Tile Sizes**:
+- 3x4: Good balance for AVX2 (8 float32 vectors)
+- 4x4: Better for AVX512 (16 float32 vectors)
+- 1x4: For decode (M=1, single row)
+- Adaptive tiling based on matrix size
+
+**For LFM2 Decode (M=1)**:
+- Most matmuls are M=1 (single token), N=2048-8192, K=2048
+- Use 1x4 or 1x8 tiles to process multiple output columns at once
+- Share single input row across multiple output computations
+
+**Implementation Strategy**:
+1. Create specialized kernels for common sizes (M=1, M=3, M=4)
+2. Use tile packing to handle remainder elements
+3. Integrate with llama.cpp threading model (no OpenMP in hot path)
+4. Profile and optimize for L2 cache locality
+
+**CRITICAL FINDING - Apple Silicon**:
+- Custom matmul kernels from justine.lol are SLOWER than Apple Accelerate on M-series chips
+- Tested: Custom 1x4 GEMV kernel = 9.4 tok/s vs Accelerate = 14.1 tok/s (33% slower!)
+- Reason: Apple Accelerate is already highly optimized for Apple Silicon unified memory
+- Justine's optimizations target x86 where MKL has overhead
+- **Conclusion**: On Apple Silicon, stick with Accelerate for matmul, optimize elsewhere
+
 ## From llama.cpp
 
 ### GGUF Format Structure
@@ -533,6 +622,47 @@ void* data = mmap(NULL, size, PROT_READ, MAP_PRIVATE, fd, 0);
 
 ---
 
+## From llama.cpp Reverse Engineering (Optimization Breakthrough)
+
+### Q8_0 Dot Product Optimization (The "Juice")
+
+**Source Analysis**: `ggml/src/ggml-cpu/arch/arm/quants.c` (lines 1086-1116)
+
+**Critical Findings**:
+1.  **Block Unrolling (2x)**:
+    - Processes **2 blocks (64 elements)** per loop iteration.
+    - Reads two `Q8_0` blocks (`x0`, `x1`) and two `y` blocks (`y0`, `y1`).
+    - Minimizes loop overhead and maximizes pipeline utilization.
+
+2.  **Integer Dot Product (vdotq_s32)**:
+    - **does NOT** dequantize to float before multiplication.
+    - Uses `vdotq_s32` (SDOT instruction) to multiply `int8x16` vectors directly.
+    - Accumulates into `int32` registers.
+    - **Memory Bandwidth**: 1 byte/weight (vs 4 bytes if dequantized to float).
+    - **Throughput**: SDOT instruction performs 4 multiplies per cycle per lane.
+
+3.  **Accumulation Strategy**:
+    - Accumulates results into `float32x4_t` vectors `sumv0` and `sumv1`.
+    - Only performs FMA (floating point multiply-add) with the block scale **after** the dot product.
+    - `sum = sum + (int_dot_prod * (scale_x * scale_y))`
+    - Reduces the number of expensive floating point operations.
+
+4.  **Bypassing BLAS for M=1**:
+    - For vector-matrix multiplication (`gemv`, used in decode), `llama.cpp` **avoids** generic BLAS (`cblas_sgemm`).
+    - Uses this custom hand-written NEON kernel instead.
+    - Eliminates function call overhead and generic dispatcher overhead.
+
+**Implementation Plan for Omni Core**:
+1.  Implement `omni_gemv_q8_0_neon` in `kernels.cpp`.
+2.  Use `__ARM_FEATURE_DOTPROD` or `vdotq_s32` intrinsic.
+3.  Unroll loop 2x (process 64 weights).
+4.  Bypass Apple Accelerate for `M=1` decode path.
+
+**Expected Gain**:
+- Increase from 14 tok/s to >35 tok/s by removing memory bandwidth bottleneck.
+- Current: Read Int8 -> Convert to F32 -> F32 Math (4x bandwidth).
+- Optimized: Read Int8 -> Int8 Math -> Scale (1x bandwidth).
+
 ## Benchmarking
 
 ### What to Measure
@@ -823,3 +953,327 @@ tokens = tokenizer.apply_chat_template(
 4. **Min-P > Top-P** - More effective for coherent generation
 5. **Low temperature (0.3)** - Better for factual responses
 6. **Decode with skip_special_tokens=True** - Clean output for users
+
+---
+
+## Reverse Engineering: MLX (2026-01-22)
+
+### Overview
+MLX is Apple's machine learning framework designed specifically for Apple Silicon. It achieves high performance through native Metal GPU compute shaders with unified memory architecture.
+
+### Key Architecture Findings
+
+#### 1. **Metal Device Management** (mlx/backend/metal/device.cpp)
+- Uses `MTL::CopyAllDevices()` to get Metal devices
+- Command queues with concurrent dispatch: `computeCommandEncoder(MTL::DispatchTypeConcurrent)`
+- Smart memory barrier management between encoders
+- Kernel caching system with library/kernel maps
+- Residency sets for keeping model weights resident on GPU
+
+#### 2. **GEMV Metal Kernel Design** (mlx/backend/metal/kernels/gemv.metal)
+Key optimizations:
+```metal
+template <typename T,
+    const int BM, /* Threadgroup rows (in simdgroups) */
+    const int BN, /* Threadgroup cols (in simdgroups) */
+    const int SM, /* Simdgroup rows (in threads) */
+    const int SN, /* Simdgroup cols (in threads) */
+    const int TM, /* Thread rows (in elements) */
+    const int TN, /* Thread cols (in elements) */
+    ...>
+struct GEMVKernel {
+    // Each thread handles TM x TN block
+    // Uses simd_sum for efficient reduction within simdgroup
+    // Threadgroup memory for cross-simdgroup accumulation
+};
+```
+
+**Key Patterns:**
+- **SIMD Group Reductions**: Uses `simd_sum()` and `simd_shuffle_down()` for efficient parallel reduction
+- **Threadgroup Memory**: Uses `threadgroup` memory for cross-simdgroup reduction
+- **Thread-Local Accumulation**: Each thread accumulates results locally before reducing
+- **Multiple Block Sizes**: Configurable BM, BN, SM, SN, TM, TN for different workloads
+- **Safe/Unsafe Load Paths**: Separate paths for aligned vs edge cases
+
+#### 3. **Quantized GEMV** (mlx/backend/metal/kernels/quantized.h)
+Supports 2/3/4/5/6/8-bit quantization with:
+```metal
+template <int bits, int wsize = 8>
+inline constexpr short get_pack_factor() {
+  return (bits == 3 || bits == 5) ? 8 : (bits == 6 ? 4 : wsize / bits);
+}
+```
+
+**Key Patterns:**
+- **Fused Dequant+Dot**: Dequantizes on-the-fly during dot product
+- **Simdgroup Parallelism**: Each simdgroup processes multiple output rows
+- **Block Processing**: Processes quantization blocks (32 elements) as atomic unit
+- **Quad Groups**: Uses quad (4-thread) groups for small workloads
+
+#### 4. **RMS Norm Metal Kernel** (mlx/backend/metal/kernels/rms_norm.metal)
+```metal
+template <typename T, int N_READS = RMS_N_READS>
+[[kernel]] void rms_single_row(...) {
+    // Phase 1: Thread-local accumulation
+    for (int i = 0; i < N_READS; i++) {
+        float xi = x[i];
+        acc += xi * xi;
+    }
+    
+    // Phase 2: Simd sum
+    acc = simd_sum(acc);
+    
+    // Phase 3: Cross-simdgroup reduction via threadgroup memory
+    if (simd_lane_id == 0) {
+        local_sums[simd_group_id] = acc;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    
+    // Phase 4: Final reduction and normalize
+    local_inv_mean[0] = metal::precise::rsqrt(acc / axis_size + eps);
+    
+    // Phase 5: Apply normalization
+    out[i] = w[i] * static_cast<T>(x[i] * local_inv_mean[0]);
+}
+```
+
+#### 5. **Steel GEMM Dispatch** (mlx/backend/metal/matmul.cpp)
+Apple's STEEL (Streaming Tensor Engine for Efficient Linear) kernels:
+- **Block sizes**: 64x64, 32x64, 64x32 with BK=16 or 32
+- **Warp dimensions**: wm=2, wn=2 (warps per tile)
+- **Swizzle pattern**: For cache efficiency
+- **Split-K**: For tall/skinny matrices with large K dimension
+
+```cpp
+// Split-K when output is small but K is large
+if (batch_size_out == 1 && (_tm * _tn) <= 32 && _tk >= 8) {
+    return steel_gemm_splitk_axpby(...)
+}
+```
+
+---
+
+## Reverse Engineering: llama.cpp GGML Metal (2026-01-22)
+
+### Overview
+GGML Metal backend achieves high performance through carefully optimized Metal shaders with extensive quantization support.
+
+### Key Architecture Findings
+
+#### 1. **Metal Backend Interface** (ggml/src/ggml-metal/ggml-metal.cpp)
+- **Shared vs Private Buffers**: Uses `MTLStorageMode.shared` for CPU-GPU accessible memory
+- **Mapped Buffers**: Zero-copy buffers from host memory with `buffer_from_host_ptr`
+- **Graph Optimization**: Pre-processes computation graph for Metal execution
+- **Async Tensor Ops**: `set_tensor_async` and `get_tensor_async` for overlapped transfers
+
+```cpp
+static ggml_backend_buffer_i ggml_backend_metal_buffer_shared_i = {
+    .free_buffer    = ggml_backend_metal_buffer_shared_free_buffer,
+    .get_base       = ggml_backend_metal_buffer_shared_get_base,
+    .memset_tensor  = ggml_backend_metal_buffer_shared_memset_tensor,
+    .set_tensor     = ggml_backend_metal_buffer_shared_set_tensor,
+    .get_tensor     = ggml_backend_metal_buffer_shared_get_tensor,
+    ...
+};
+```
+
+#### 2. **Q8_0 Dequantization** (ggml/src/ggml-metal/ggml-metal.metal)
+```metal
+template <typename type4x4>
+void dequantize_q8_0(device const block_q8_0 *xb, short il, thread type4x4 & reg) {
+    device const int8_t * qs = ((device const int8_t *)xb->qs);
+    const float d = xb->d;
+    
+    float4x4 reg_f;
+    for (int i = 0; i < 16; i++) {
+        reg_f[i/4][i%4] = (qs[i + 16*il] * d);
+    }
+    reg = (type4x4) reg_f;
+}
+```
+
+**Key Patterns:**
+- Uses `float4x4` (4x4 matrix) as basic processing unit = 16 elements
+- `il` (index low) splits block into two halves for parallel processing
+- Direct pointer casting for efficient memory access
+
+#### 3. **Q4_K Complex Dequantization**
+```metal
+template <typename type4x4>
+void dequantize_q4_K(device const block_q4_K * xb, short il, thread type4x4 & reg) {
+    device const uchar * q = xb->qs;
+    
+    short is = (il/4) * 2;
+    q = q + (il/4) * 32 + 16 * (il&1);
+    il = il & 3;
+    const uchar2 sc = get_scale_min_k4_just2(is, il/2, xb->scales);
+    const float d   = il < 2 ? xb->d : xb->d / 16.h;
+    const float min = xb->dmin;
+    ...
+}
+```
+
+#### 4. **Metal Buffer Allocation Strategy**
+- **32-byte alignment**: Required for Metal buffer access
+- **Max buffer size**: Device-dependent, from `device->maxBufferLength()`
+- **Extra allocation** for Flash Attention, mul_mat_id operations
+
+### Key Optimization Patterns for Omni Core
+
+Based on MLX and llama.cpp analysis, here are the critical optimizations needed:
+
+#### **Priority 1: Metal GEMV Kernel**
+The single biggest win for single-token decode:
+1. Create Metal compute shader for matrix-vector multiplication
+2. Use simd_sum/shuffle for efficient reduction
+3. Process Q8_0 directly on GPU (fused dequant+dot)
+4. Target block size 4x1 or 8x1 for GEMV
+
+#### **Priority 2: Unified Memory Zero-Copy**
+1. Keep model weights in Metal buffers (shared storage mode)
+2. Avoid CPU↔GPU copies - use unified memory directly
+3. Make buffers resident with residency sets
+
+#### **Priority 3: Metal RMS Norm + SiLU + RoPE**
+1. Fuse normalization operations into single kernel
+2. Use simd_sum for parallel reduction
+3. Batch process with N_READS pattern
+
+#### **Priority 4: Flash Attention on Metal**
+1. Block-wise attention with threadgroup memory
+2. Fused softmax within attention computation
+3. Use simd operations for score accumulation
+
+### Performance Expectations
+
+Based on MLX achieving 50+ tok/s for similar model sizes:
+- **Metal GEMV**: 2-3x speedup for matmul (14 → 35-40 tok/s)
+- **Fused Kernels**: Additional 10-20% improvement
+- **Memory Resident**: Eliminates buffer allocation overhead
+- **Target**: 35-50 tok/s on M-series chips
+
+---
+
+## Implementation Plan: Metal Backend for Omni Core
+
+### Critical Findings from Reverse Engineering (2026-01-22)
+
+**MLX GEMV Kernel Architecture** (gemv.metal):
+```metal
+template <typename T, int BM, int BN, int SM, int SN, int TM, int TN>
+struct GEMVKernel {
+  // BM, BN: Threadgroup blocks (in simdgroups)
+  // SM, SN: Simdgroup size (in threads) - must be 32 total
+  // TM, TN: Thread work size (in elements)
+  
+  // Key pattern: Each thread processes TM x TN block
+  // Uses simd_shuffle_down for efficient reduction
+  // Threadgroup memory for cross-simdgroup accumulation
+}
+```
+
+**Optimal Block Sizes for Decode (M=1)**:
+- `BM=4, BN=1, SM=1, SN=32, TM=4, TN=4` - Best for single-token decode
+- `BM=8, BN=1, SM=1, SN=32, TM=4, TN=4` - Alternative for larger outputs
+
+**llama.cpp Q8_0 Dequantization** (ggml-metal.metal):
+```metal
+template <typename type4x4>
+void dequantize_q8_0(device const block_q8_0 *xb, short il, thread type4x4 & reg) {
+    device const int8_t * qs = ((device const int8_t *)xb->qs);
+    const float d = xb->d;  // F16 scale
+    
+    float4x4 reg_f;
+    for (int i = 0; i < 16; i++) {
+        reg_f[i/4][i%4] = (qs[i + 16*il] * d);
+    }
+    reg = (type4x4) reg_f;
+}
+```
+
+**Key Patterns**:
+1. **Simd Reductions**: `simd_shuffle_down()` for parallel sum within simdgroup
+2. **Threadgroup Memory**: For cross-simdgroup accumulation
+3. **float4x4**: Process 16 elements at once (4x4 matrix)
+4. **Unified Memory**: Zero-copy with `MTLStorageMode.shared`
+5. **Pipeline Caching**: Compile once, reuse forever
+
+### Phase 1: Metal Infrastructure (Core)
+**Goal**: Initialize Metal device, create command queue, load shaders
+
+**Files to Create**:
+- `core/metal/device.mm` - Objective-C++ Metal device wrapper
+- `core/metal/kernels.metal` - Metal shader library
+- `core/include/omni_metal.h` - C API for Metal backend
+
+**Key APIs**:
+```objc
+id<MTLDevice> device = MTLCreateSystemDefaultDevice();
+id<MTLCommandQueue> queue = [device newCommandQueue];
+id<MTLLibrary> library = [device newLibraryWithSource:src options:nil error:&error];
+id<MTLComputePipelineState> pipeline = [device newComputePipelineStateWithFunction:func error:&error];
+```
+
+### Phase 2: Metal GEMV Q8_0 Kernel
+**Goal**: Fused dequant+matmul for single-token decode (M=1)
+
+**Kernel Signature**:
+```metal
+kernel void gemv_q8_0(
+    device const block_q8_0* B [[buffer(0)]],  // Quantized weights [N, K]
+    device const float* A [[buffer(1)]],        // Input vector [K]
+    device float* C [[buffer(2)]],              // Output vector [N]
+    constant int& K [[buffer(3)]],              // Input size
+    constant int& N [[buffer(4)]],              // Output size
+    uint tid [[thread_position_in_grid]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]])
+```
+
+**Algorithm**:
+1. Each thread processes 4 output elements (TM=4)
+2. Loop over K in blocks of 32 (Q8_0 block size)
+3. Dequantize on-the-fly: `weight = scale * int8_value`
+4. Accumulate: `result += A[k] * weight`
+5. Simd reduction with `simd_shuffle_down()`
+6. Write output
+
+### Phase 3: Metal RMS Norm Kernel
+**Goal**: Fast normalization with simd reductions
+
+**Kernel Signature**:
+```metal
+kernel void rms_norm(
+    device const float* x [[buffer(0)]],
+    device const float* weight [[buffer(1)]],
+    device float* out [[buffer(2)]],
+    constant int& n [[buffer(3)]],
+    constant float& eps [[buffer(4)]],
+    uint tid [[thread_position_in_grid]],
+    uint simd_lid [[thread_index_in_simdgroup]])
+```
+
+**Algorithm**:
+1. Thread-local accumulation: `sum_sq += x[i] * x[i]`
+2. Simd sum: `sum_sq = simd_sum(sum_sq)`
+3. Compute RMS: `rms = 1.0 / sqrt(sum_sq / n + eps)`
+4. Apply: `out[i] = x[i] * rms * weight[i]`
+
+### Phase 4: Metal Attention Kernel
+**Goal**: Efficient Q·K^T + softmax + Score·V
+
+**Approach**: Use 3 separate kernels (easier to optimize):
+1. `attn_scores`: Compute Q·K^T with causal mask
+2. `attn_softmax`: Numerically stable softmax
+3. `attn_values`: Weighted sum of V
+
+### Phase 5: Integration & Optimization
+1. Fallback to CPU for unsupported ops
+2. Profile with Xcode Instruments
+3. Optimize buffer management
+4. Tune threadgroup sizes
+
+**Expected Performance**:
+- Metal GEMV: 2-3x faster than CPU Accelerate
+- Target: 35-50 tok/s (vs current 14.1 tok/s)
+- Memory: Same (unified memory, zero-copy)

@@ -11,6 +11,10 @@
 #include <iostream>
 #include <vector>
 
+#if defined(__ARM_NEON)
+#include <arm_neon.h>
+#endif
+
 // Helper: Get weight with caching (dequantize once, reuse forever)
 static float *get_cached_weight(omni_context *ctx, const char *name) {
   // Check if already cached
@@ -38,6 +42,30 @@ static float *get_cached_weight(omni_context *ctx, const char *name) {
   omni_get_tensor_f32(ctx->model, name, cache.data());
 
   return cache.data();
+}
+
+// Helper: Smart matmul that uses assembly for Q8_0 weights
+static void smart_matmul(omni_context *ctx, float *C, const float *A,
+                         const char *weight_name, int M, int N, int K) {
+  const omni_tensor *tensor = omni_get_tensor(ctx->model, weight_name);
+  if (!tensor) {
+    std::cerr << "Weight not found: " << weight_name << "\n";
+    return;
+  }
+
+  // For single-token decode (M=1) with Q8_0 weights, use assembly kernel
+  // directly This avoids caching and uses fused dequant+matmul (saves memory
+  // bandwidth)
+  if (M == 1 && tensor->dtype == OMNI_Q8_0) {
+    omni_gemv_q8_0_neon(C, A, tensor->data, N, K);
+    return;
+  }
+
+  // For multi-token or non-Q8_0, use cached weights with Accelerate BLAS
+  float *B = get_cached_weight(ctx, weight_name);
+  if (B) {
+    omni_matmul(C, A, B, M, N, K);
+  }
 }
 
 // Create inference context
@@ -109,12 +137,10 @@ static void lfm2_conv_block(omni_context *ctx, float *output,
   snprintf(weight_names[2], 256, "model.layers.%d.conv.out_proj.weight",
            layer_idx);
 
-  float *in_proj = get_cached_weight(ctx, weight_names[0]);
   float *conv_w =
       get_cached_weight(ctx, weight_names[1]); // [hidden, 1, kernel_size]
-  float *out_proj = get_cached_weight(ctx, weight_names[2]);
 
-  if (!in_proj || !conv_w || !out_proj) {
+  if (!conv_w) {
     memcpy(output, input, n_tokens * hidden * sizeof(float));
     return;
   }
@@ -140,44 +166,122 @@ static void lfm2_conv_block(omni_context *ctx, float *output,
                          n_tokens); // [hidden, n_tokens] - C for output gating
   std::vector<float> conv_out_t(hidden * n_tokens);
 
-  // 1. in_proj: [n_tokens, hidden] @ [3*hidden, hidden].T -> [n_tokens,
-  // 3*hidden]
-  omni_matmul(bcx.data(), input, in_proj, n_tokens, proj_size, hidden);
+  // 1. in_proj: [n_tokens, hidden] @ [3*hidden, hidden].T ->
+  // [n_tokens, 3*hidden]
+  // 1. in_proj: [n_tokens, hidden] @ [3*hidden, hidden].T ->
+  // [n_tokens, 3*hidden]
+  smart_matmul(ctx, bcx.data(), input, weight_names[0], n_tokens, proj_size,
+               hidden);
 
   // 2. Transpose and split: BCx -> B, C, X, then compute Bx = B * x
   // Layout after transpose: [3*hidden, n_tokens]
-  for (int h = 0; h < hidden; h++) {
-    for (int t = 0; t < n_tokens; t++) {
-      // BCx is [n_tokens, 3*hidden], access as bcx[t * proj_size + offset]
-      float b = bcx[t * proj_size + h];              // B[t, h]
-      float c = bcx[t * proj_size + hidden + h];     // C[t, h]
-      float x = bcx[t * proj_size + 2 * hidden + h]; // X[t, h]
+  // Optimized with NEON for single token decode
+#if defined(__ARM_NEON)
+  if (n_tokens == 1) {
+    // Single token: process 4 channels at a time
+    int h = 0;
+    for (; h + 4 <= hidden; h += 4) {
+      // Load B, C, X for 4 channels
+      float32x4_t vb = vld1q_f32(bcx.data() + h);
+      float32x4_t vc = vld1q_f32(bcx.data() + hidden + h);
+      float32x4_t vx = vld1q_f32(bcx.data() + 2 * hidden + h);
 
-      bx_t[h * n_tokens + t] = b * x; // Bx[h, t] after gating
-      c_t[h * n_tokens + t] = c;      // C[h, t] for output gating
+      // Compute Bx = B * X
+      float32x4_t vbx = vmulq_f32(vb, vx);
+
+      // Store results
+      vst1q_f32(bx_t.data() + h, vbx);
+      vst1q_f32(c_t.data() + h, vc);
     }
+
+    // Handle remaining channels
+    for (; h < hidden; h++) {
+      float b = bcx[h];
+      float c = bcx[hidden + h];
+      float x = bcx[2 * hidden + h];
+      bx_t[h] = b * x;
+      c_t[h] = c;
+    }
+  } else {
+#endif
+    // Multi-token: use original loop
+    for (int h = 0; h < hidden; h++) {
+      for (int t = 0; t < n_tokens; t++) {
+        float b = bcx[t * proj_size + h];
+        float c = bcx[t * proj_size + hidden + h];
+        float x = bcx[t * proj_size + 2 * hidden + h];
+        bx_t[h * n_tokens + t] = b * x;
+        c_t[h * n_tokens + t] = c;
+      }
+    }
+#if defined(__ARM_NEON)
   }
+#endif
 
   if (use_cache) {
     // ===== DECODE MODE =====
     // PyTorch: roll left, insert new, then direct dot product
     // conv_cache layout: [hidden, kernel_size]
+    // Optimized with NEON for decode (single token)
 
+#if defined(__ARM_NEON)
+    // Process 4 channels at a time with NEON
+    int h = 0;
+    for (; h + 4 <= hidden; h += 4) {
+      // Roll cache left for 4 channels
+      for (int k = 0; k < kernel_size - 1; k++) {
+        conv_cache[h * kernel_size + k] = conv_cache[h * kernel_size + k + 1];
+        conv_cache[(h + 1) * kernel_size + k] =
+            conv_cache[(h + 1) * kernel_size + k + 1];
+        conv_cache[(h + 2) * kernel_size + k] =
+            conv_cache[(h + 2) * kernel_size + k + 1];
+        conv_cache[(h + 3) * kernel_size + k] =
+            conv_cache[(h + 3) * kernel_size + k + 1];
+      }
+
+      // Insert new Bx values
+      conv_cache[h * kernel_size + (kernel_size - 1)] = bx_t.data()[h];
+      conv_cache[(h + 1) * kernel_size + (kernel_size - 1)] =
+          bx_t.data()[h + 1];
+      conv_cache[(h + 2) * kernel_size + (kernel_size - 1)] =
+          bx_t.data()[h + 2];
+      conv_cache[(h + 3) * kernel_size + (kernel_size - 1)] =
+          bx_t.data()[h + 3];
+
+      // Dot product for 4 channels
+      float32x4_t vsum = vdupq_n_f32(0.0f);
+      for (int k = 0; k < kernel_size; k++) {
+        float32x4_t vcache = {conv_cache[h * kernel_size + k],
+                              conv_cache[(h + 1) * kernel_size + k],
+                              conv_cache[(h + 2) * kernel_size + k],
+                              conv_cache[(h + 3) * kernel_size + k]};
+        float32x4_t vweight = {conv_w[h * kernel_size + k],
+                               conv_w[(h + 1) * kernel_size + k],
+                               conv_w[(h + 2) * kernel_size + k],
+                               conv_w[(h + 3) * kernel_size + k]};
+        vsum = vfmaq_f32(vsum, vcache, vweight);
+      }
+      vst1q_f32(conv_out_t.data() + h, vsum);
+    }
+
+    // Handle remaining channels
+    for (; h < hidden; h++) {
+#else
     for (int h = 0; h < hidden; h++) {
+#endif
       // 1. Roll cache left by 1 position
       for (int k = 0; k < kernel_size - 1; k++) {
         conv_cache[h * kernel_size + k] = conv_cache[h * kernel_size + k + 1];
       }
       // 2. Insert new Bx at the rightmost position
-      conv_cache[h * kernel_size + (kernel_size - 1)] =
-          bx_t[h]; // n_tokens=1, so bx_t[h*1 + 0]
+      conv_cache[h * kernel_size + (kernel_size - 1)] = bx_t.data()[h];
 
       // 3. Direct dot product: conv_out = sum(cache * weights)
       float sum = 0.0f;
       for (int k = 0; k < kernel_size; k++) {
         sum += conv_cache[h * kernel_size + k] * conv_w[h * kernel_size + k];
       }
-      conv_out_t[h] = sum; // [hidden, 1]
+      conv_out_t[h] = sum;
     }
   } else {
     // ===== PREFILL MODE =====
@@ -194,7 +298,8 @@ static void lfm2_conv_block(omni_context *ctx, float *output,
       }
     }
 
-    // Convolve: output length = padded_len - kernel_size + 1 = n_tokens
+    // Convolve: output length = padded_len - kernel_size + 1 =
+    // n_tokens
     for (int h = 0; h < hidden; h++) {
       for (int t = 0; t < n_tokens; t++) {
         float sum = 0.0f;
@@ -205,9 +310,9 @@ static void lfm2_conv_block(omni_context *ctx, float *output,
       }
     }
 
-    // Cache last kernel_size values of Bx (with left-padding if n_tokens <
-    // kernel_size) This matches PyTorch: conv_state = F.pad(Bx, (L_cache -
-    // Bx.shape[-1], 0))
+    // Cache last kernel_size values of Bx (with left-padding if
+    // n_tokens < kernel_size) This matches PyTorch: conv_state =
+    // F.pad(Bx, (L_cache - Bx.shape[-1], 0))
     for (int h = 0; h < hidden; h++) {
       if (n_tokens >= kernel_size) {
         // Copy last kernel_size values
@@ -229,24 +334,49 @@ static void lfm2_conv_block(omni_context *ctx, float *output,
   }
 
   // 4. Output gating: y = C * conv_out
+  // Optimized with NEON for single token
   std::vector<float> y_t(hidden * n_tokens);
-  for (int h = 0; h < hidden; h++) {
-    for (int t = 0; t < n_tokens; t++) {
-      y_t[h * n_tokens + t] =
-          c_t[h * n_tokens + t] * conv_out_t[h * n_tokens + t];
+#if defined(__ARM_NEON)
+  if (n_tokens == 1) {
+    int h = 0;
+    for (; h + 4 <= hidden; h += 4) {
+      float32x4_t vc = vld1q_f32(c_t.data() + h);
+      float32x4_t vconv = vld1q_f32(conv_out_t.data() + h);
+      float32x4_t vy = vmulq_f32(vc, vconv);
+      vst1q_f32(y_t.data() + h, vy);
     }
+    for (; h < hidden; h++) {
+      y_t[h] = c_t[h] * conv_out_t[h];
+    }
+  } else {
+#endif
+    for (int h = 0; h < hidden; h++) {
+      for (int t = 0; t < n_tokens; t++) {
+        y_t[h * n_tokens + t] =
+            c_t[h * n_tokens + t] * conv_out_t[h * n_tokens + t];
+      }
+    }
+#if defined(__ARM_NEON)
   }
+#endif
 
   // 5. Transpose back: [hidden, n_tokens] -> [n_tokens, hidden]
+  // For single token, this is just a copy
   std::vector<float> y(n_tokens * hidden);
-  for (int h = 0; h < hidden; h++) {
-    for (int t = 0; t < n_tokens; t++) {
-      y[t * hidden + h] = y_t[h * n_tokens + t];
+  if (n_tokens == 1) {
+    memcpy(y.data(), y_t.data(), hidden * sizeof(float));
+  } else {
+    for (int h = 0; h < hidden; h++) {
+      for (int t = 0; t < n_tokens; t++) {
+        y[t * hidden + h] = y_t[h * n_tokens + t];
+      }
     }
   }
 
   // 6. Output projection
-  omni_matmul(output, y.data(), out_proj, n_tokens, hidden, hidden);
+  // 6. Output projection
+  smart_matmul(ctx, output, y.data(), weight_names[2], n_tokens, hidden,
+               hidden);
 }
 
 // Check if layer is conv or attention (LFM2 specific)
@@ -338,21 +468,17 @@ void omni_forward(omni_context *ctx, const int *tokens, int n_tokens,
       snprintf(qkv_names[2], 256, "model.layers.%d.self_attn.v_proj.weight",
                il);
 
-      float *wq = get_cached_weight(ctx, qkv_names[0]);
-      float *wk = get_cached_weight(ctx, qkv_names[1]);
-      float *wv = get_cached_weight(ctx, qkv_names[2]);
-
-      if (wq && wk && wv) {
+      if (true) {
         // GQA: K/V have fewer heads than Q
         int kv_hidden = n_kv_heads * head_dim;
 
         // QKV projections
-        omni_matmul(ctx->q_buf.data(), ctx->hidden.data(), wq, n_tokens, hidden,
-                    hidden);
-        omni_matmul(ctx->k_buf.data(), ctx->hidden.data(), wk, n_tokens,
-                    kv_hidden, hidden);
-        omni_matmul(ctx->v_buf.data(), ctx->hidden.data(), wv, n_tokens,
-                    kv_hidden, hidden);
+        smart_matmul(ctx, ctx->q_buf.data(), ctx->hidden.data(), qkv_names[0],
+                     n_tokens, hidden, hidden);
+        smart_matmul(ctx, ctx->k_buf.data(), ctx->hidden.data(), qkv_names[1],
+                     n_tokens, kv_hidden, hidden);
+        smart_matmul(ctx, ctx->v_buf.data(), ctx->hidden.data(), qkv_names[2],
+                     n_tokens, kv_hidden, hidden);
 
         // Apply QK LayerNorm (LFM2 specific)
         char qk_norm_names[2][256];
@@ -436,10 +562,25 @@ void omni_forward(omni_context *ctx, const int *tokens, int n_tokens,
                   cache_k_layer + k_pos * kv_hidden + kv_h * head_dim;
 
               // Q·K^T (K already has RoPE applied when stored)
+              // Optimized with NEON
               float score = 0.0f;
+#if defined(__ARM_NEON)
+              float32x4_t vsum = vdupq_n_f32(0.0f);
+              int d = 0;
+              for (; d + 4 <= head_dim; d += 4) {
+                float32x4_t vq = vld1q_f32(q_head + d);
+                float32x4_t vk = vld1q_f32(k_head + d);
+                vsum = vfmaq_f32(vsum, vq, vk);
+              }
+              score = vaddvq_f32(vsum);
+              for (; d < head_dim; d++) {
+                score += q_head[d] * k_head[d];
+              }
+#else
               for (int d = 0; d < head_dim; d++) {
                 score += q_head[d] * k_head[d];
               }
+#endif
               score *= scale;
 
               scores[k_pos] = score;
@@ -460,14 +601,29 @@ void omni_forward(omni_context *ctx, const int *tokens, int n_tokens,
             }
 
             // Weighted sum of values from cache
+            // Optimized with NEON
             for (int k_pos = 0; k_pos <= q_pos; k_pos++) {
               float *v_head =
                   cache_v_layer + k_pos * kv_hidden + kv_h * head_dim;
               float weight = scores[k_pos];
 
+#if defined(__ARM_NEON)
+              float32x4_t vweight = vdupq_n_f32(weight);
+              int d = 0;
+              for (; d + 4 <= head_dim; d += 4) {
+                float32x4_t vout = vld1q_f32(out_head + d);
+                float32x4_t vv = vld1q_f32(v_head + d);
+                vout = vfmaq_f32(vout, vv, vweight);
+                vst1q_f32(out_head + d, vout);
+              }
+              for (; d < head_dim; d++) {
+                out_head[d] += weight * v_head[d];
+              }
+#else
               for (int d = 0; d < head_dim; d++) {
                 out_head[d] += weight * v_head[d];
               }
+#endif
             }
           }
         }
@@ -477,12 +633,9 @@ void omni_forward(omni_context *ctx, const int *tokens, int n_tokens,
       char out_name[256];
       snprintf(out_name, sizeof(out_name),
                "model.layers.%d.self_attn.out_proj.weight", il);
-      float *wo = get_cached_weight(ctx, out_name);
 
-      if (wo) {
-        omni_matmul(ctx->hidden.data(), ctx->attn_out.data(), wo, n_tokens,
-                    hidden, hidden);
-      }
+      smart_matmul(ctx, ctx->hidden.data(), ctx->attn_out.data(), out_name,
+                   n_tokens, hidden, hidden);
     }
 
     // Add residual
@@ -512,19 +665,15 @@ void omni_forward(omni_context *ctx, const int *tokens, int n_tokens,
     snprintf(ffn_names[1], 256, "model.layers.%d.feed_forward.w2.weight", il);
     snprintf(ffn_names[2], 256, "model.layers.%d.feed_forward.w3.weight", il);
 
-    float *w1 = get_cached_weight(ctx, ffn_names[0]);
-    float *w2 = get_cached_weight(ctx, ffn_names[1]);
-    float *w3 = get_cached_weight(ctx, ffn_names[2]);
-
-    if (w1 && w2 && w3) {
+    if (true) {
       const omni_tensor *w1_tensor = omni_get_tensor(model, ffn_names[0]);
       int ffn_dim = w1_tensor->shape[0];
 
       // Gate and up projections
-      omni_matmul(ctx->ffn_buf.data(), ctx->hidden.data(), w1, n_tokens,
-                  ffn_dim, hidden);
-      omni_matmul(ctx->ffn_buf.data() + n_tokens * ffn_dim, ctx->hidden.data(),
-                  w3, n_tokens, ffn_dim, hidden);
+      smart_matmul(ctx, ctx->ffn_buf.data(), ctx->hidden.data(), ffn_names[0],
+                   n_tokens, ffn_dim, hidden);
+      smart_matmul(ctx, ctx->ffn_buf.data() + n_tokens * ffn_dim,
+                   ctx->hidden.data(), ffn_names[2], n_tokens, ffn_dim, hidden);
 
       // SiLU(gate) * up
       for (int t = 0; t < n_tokens; t++) {
@@ -538,8 +687,8 @@ void omni_forward(omni_context *ctx, const int *tokens, int n_tokens,
       }
 
       // Down projection
-      omni_matmul(ctx->hidden.data(), ctx->ffn_buf.data(), w2, n_tokens, hidden,
-                  ffn_dim);
+      smart_matmul(ctx, ctx->hidden.data(), ctx->ffn_buf.data(), ffn_names[1],
+                   n_tokens, hidden, ffn_dim);
     }
 
     // Add residual

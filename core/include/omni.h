@@ -120,6 +120,10 @@ void omni_softmax(float *x, int n);
 void omni_matmul(float *C, const float *A, const float *B, int M, int N, int K);
 void omni_matmul_q8_0(float *C, const float *A, const void *B_q8, int M, int N,
                       int K);
+void omni_matmul_q8_0_asm(float *C, const float *A, const void *B_q8, int M,
+                          int N, int K);
+void omni_gemv_q8_0_neon(float *out, const float *x, const void *W_q8, int N,
+                         int K);
 
 // Quantization
 void omni_dequant_q8_0(float *out, const void *data, int n);
@@ -130,6 +134,17 @@ void omni_dequant_q4_k(float *out, const void *data, int n);
 extern "C" {
 #endif
 void omni_dequant_q8_0_asm(float *out, const void *data, int n_blocks);
+float omni_gemv_q8_0_row_asm(const float *A, const void *B, int n_blocks);
+void omni_gemv_q8_0_4row_asm(float *out, const float *A, const void *B,
+                             int n_blocks, int stride);
+void omni_gemv_q8_s8_4row_asm(float *out, const int8_t *A_q, const void *B,
+                              int n_blocks, int stride);
+void omni_attn_score_asm(float *scores, const float *q, const float *k_cache,
+                         int n_pos, int head_dim, int kv_stride);
+void omni_attn_value_asm(float *out, const float *scores, const float *v_cache,
+                         int n_pos, int head_dim, int kv_stride);
+void omni_rms_norm_asm(float *out, const float *x, const float *w, int n,
+                       float eps);
 #ifdef __cplusplus
 }
 #endif

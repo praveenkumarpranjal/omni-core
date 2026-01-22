@@ -51,10 +51,10 @@ pip
 - Other platforms come later
 
 ### 6. Language Split
-- **C++ (80%)**: Core engine, inference, memory management
-- **Rust (15%)**: CLI, model conversion, thread-safe utilities
-- **Assembly (5%)**: Critical hot paths only (Q4_K matmul, RoPE)
-- **Python**: Thin wrapper only (optional)
+- **C++ (80%)**: Core engine, inference, memory management ✅
+- **Rust (19%)**: CLI, chat interface, safe FFI bindings ✅
+- **Assembly (1%)**: Critical hot paths (Q8_0 dequant, GEMV) ✅
+- **Python**: Only convert.py for model conversion (can be ported later)
 
 ### 7. Architecture
 - **Separate binaries**: Rust CLI → C++ library (libomni.dylib)

@@ -8,7 +8,6 @@
 #include <cstring>
 #include <fcntl.h>
 #include <iostream>
-#include <sstream>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>

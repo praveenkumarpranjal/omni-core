@@ -48,6 +48,12 @@ test_report.md
 *.gguf
 *.safetensors
 
+# Reference projects (for learning only)
+reference-project/
+
+# Tokenizer
+tokenizer.json
+
 # CMake
 CMakeCache.txt
 CMakeFiles/

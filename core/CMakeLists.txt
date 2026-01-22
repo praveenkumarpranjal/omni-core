@@ -6,7 +6,7 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 # Optimization flags for Apple Silicon
-set(CMAKE_CXX_FLAGS_RELEASE "-O3 -march=native -mcpu=apple-m1 -DNDEBUG")
+set(CMAKE_CXX_FLAGS_RELEASE "-O3 -march=native -mcpu=apple-m1 -DNDEBUG -ffast-math")
 
 # Source files
 set(SOURCES
@@ -46,3 +46,4 @@ install(FILES include/omni.h DESTINATION include)
 # Print configuration
 message(STATUS "Build type: ${CMAKE_BUILD_TYPE}")
 message(STATUS "C++ flags: ${CMAKE_CXX_FLAGS_RELEASE}")
+
